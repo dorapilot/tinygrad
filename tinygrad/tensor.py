@@ -597,17 +597,18 @@ class Tensor(RandMixin):
   # ***** creation entrypoint *****
 
   @staticmethod
-  def from_blob(ptr:int, shape:tuple[int, ...], **kwargs) -> Tensor:
+  def from_blob(ptr:int, shape:tuple[int, ...], fd:int|None=None, offset:int=0, **kwargs) -> Tensor:
     """
     Exposes the pointer as a Tensor without taking ownership of the original data.
     The pointer must remain valid for the entire lifetime of the created Tensor.
 
     You can pass in `dtype` and `device` keyword arguments to control the data type and device of the tensor.
+    Pass a DMA-BUF `fd` and byte `offset` when the device requires them to import the pointer. The caller retains ownership of the fd.
     Additionally, all other keyword arguments are passed to the constructor of the tensor.
     """
     r = Tensor.empty(*shape, **kwargs)
     assert isinstance(r.device, str)
-    cast(Buffer, r.uop.buffer).allocate(external_ptr=ptr)
+    cast(Buffer, r.uop.buffer).allocate(external_ptr=ptr, external_fd=fd, external_offset=offset)
     return r
 
   @staticmethod

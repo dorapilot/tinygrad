@@ -1,4 +1,4 @@
-import ctypes, mmap, struct, sys, unittest
+import ctypes, errno, mmap, os, struct, sys, tempfile, unittest
 from unittest.mock import Mock, patch
 from tinygrad.runtime.autogen import msm_drm
 
@@ -24,6 +24,32 @@ class TestMSMDRMUAPI(unittest.TestCase):
 
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestMSMInterface(unittest.TestCase):
+  def test_import_alias_lifetime(self):
+    from tinygrad.runtime.ops_qcom import MSMIface
+    iface = object.__new__(MSMIface)
+    iface.fd, iface.allocations = Mock(), {}
+    memory = (ctypes.c_ubyte * mmap.PAGESIZE)()
+    with tempfile.TemporaryFile() as source, \
+         patch.object(msm_drm, 'DRM_IOCTL_PRIME_FD_TO_HANDLE', return_value=Mock(handle=7)) as prime, \
+         patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_INFO', return_value=Mock(value=0x10000000)), \
+         patch.object(msm_drm, 'DRM_IOCTL_GEM_CLOSE') as close:
+      source.truncate(mmap.PAGESIZE)
+      first = iface.map(ctypes.addressof(memory), 64, source.fileno())
+      second = iface.map(ctypes.addressof(memory) + 32, 32, source.fileno(), 32)
+      self.assertEqual((first.buf, second.buf), (0x10000000, 0x10000020))
+      self.assertIs(first.meta, second.meta)
+      self.assertIsNone(first.host)
+      with self.assertRaisesRegex(ValueError, 'exceeds DMA-BUF'):
+        iface.map(ctypes.addressof(memory), mmap.PAGESIZE + 1, source.fileno())
+      self.assertEqual(prime.call_count, 2)
+      iface.free(first)
+      close.assert_not_called()
+      iface.free(second)
+      close.assert_called_once_with(iface.fd, handle=7)
+      self.assertEqual(iface.allocations, {})
+      self.assertEqual(os.fstat(source.fileno()).st_size, mmap.PAGESIZE)
+      iface.fd.munmap.assert_not_called()
+
   def test_allocation_and_submit(self):
     from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface
     memory = [(ctypes.c_ubyte * mmap.PAGESIZE)() for _ in range(2)]
@@ -112,6 +138,50 @@ class TestMSMReplay(unittest.TestCase):
                          devs=('QCOM',), queue='COMPUTE:0')
     call = UOp.sink(submit, arg=KernelInfo('submit_test')).call(buf, aux=HCQInfo(('QCOM',)))
     return hcq_link(lower_and_compile(UOp(Ops.LINEAR, src=(lower_call(call),))), allow_cache=False)
+
+  def test_import_tensor_cpu_access(self):
+    from tinygrad import Tensor, dtypes
+    from tinygrad.device import Buffer
+    from tinygrad.runtime.autogen import dma_buf
+    memory = (ctypes.c_ubyte * 96)(*range(96))
+    with tempfile.TemporaryFile() as source, \
+         patch.object(msm_drm, 'DRM_IOCTL_PRIME_FD_TO_HANDLE', return_value=Mock(handle=4096)), \
+         patch.object(dma_buf, 'DMA_BUF_IOCTL_SYNC') as sync:
+      source.truncate(96)
+      tensor = Tensor.from_blob(ctypes.addressof(memory) + 32, (64,), fd=source.fileno(), offset=32, dtype=dtypes.uint8, device='QCOM')
+      buf = tensor.uop.buffer
+      try:
+        sync.side_effect = [OSError(errno.EINTR, 'interrupted'), None, None]
+        self.assertEqual(buf.numpy().tolist(), list(range(32, 96)))
+        self.assertEqual([c.kwargs['flags'] for c in sync.call_args_list], [dma_buf.DMA_BUF_SYNC_READ] * 2 +
+                         [dma_buf.DMA_BUF_SYNC_READ | dma_buf.DMA_BUF_SYNC_END])
+        sync.reset_mock(side_effect=True)
+        buf.copy_from(Buffer('PYTHON', 64, dtypes.uint8, initial_value=bytes(reversed(range(64)))))
+        self.assertEqual(list(memory), list(range(32)) + list(reversed(range(64))))
+        self.assertEqual([c.kwargs['flags'] for c in sync.call_args_list],
+                         [dma_buf.DMA_BUF_SYNC_WRITE, dma_buf.DMA_BUF_SYNC_WRITE | dma_buf.DMA_BUF_SYNC_END])
+        sync.side_effect = OSError(errno.EIO, 'sync failed')
+        with self.assertRaises(OSError): buf.numpy()
+      finally:
+        buf.deallocate()
+
+  def test_cached_owned_import_alias(self):
+    from tinygrad import dtypes
+    from tinygrad.device import Buffer
+    original = Buffer('QCOM', 64, dtypes.uint8, preallocate=True)
+    allocation, ptr = original.meta, original.host.addr
+    original.deallocate()
+    with tempfile.TemporaryFile() as source, \
+         patch.object(msm_drm, 'DRM_IOCTL_PRIME_FD_TO_HANDLE', return_value=Mock(handle=allocation.handle)), \
+         patch.object(msm_drm, 'DRM_IOCTL_GEM_CLOSE') as close:
+      source.truncate(64)
+      imported = Buffer('QCOM', 64, dtypes.uint8).allocate(external_ptr=ptr, external_fd=source.fileno())
+      self.assertEqual(allocation.references, 1)
+      self.assertFalse(any(s.meta is allocation for cached in self.dev.allocator.cache.values() for s in cached))
+      close.assert_not_called()
+      imported.deallocate()
+      close.assert_called_once_with(self.dev.iface.fd, handle=allocation.handle)
+      self.assertNotIn(allocation.handle, self.dev.iface.allocations)
 
   def test_replacement_views(self):
     from tinygrad import dtypes

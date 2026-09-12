@@ -89,6 +89,8 @@ class BufferSpec:
   nolru: bool = False
   zero: bool = False
   external_ptr: int|None = None
+  external_fd: int|None = None
+  external_offset: int = 0
 
 class MultiBuffer:
   def __init__(self, device:tuple[str, ...], size:int, dtype:DType):
@@ -158,12 +160,13 @@ class Buffer:
 
   def is_allocated(self) -> bool: return self._storage is not None and (self._base is None or self._base_storage is self.base._storage)
   def ensure_allocated(self) -> Buffer: return self.allocate() if not self.is_allocated() else self
-  def allocate(self, opaque=None, external_ptr=None) -> Buffer:
+  def allocate(self, opaque=None, external_ptr=None, external_fd=None, external_offset=0) -> Buffer:
     assert not self.is_allocated(), "can't allocate already allocated buffer"
     if DEBUG >= 7: print(f"buffer: allocate {self.nbytes} bytes on {self.device}")
     if not self.device.startswith("NULL") and self.size > MAX_BUFFER_SIZE > 0 and self.options.external_ptr is None:
       raise RuntimeError(f"buffer of size {self.size/1e6:.2f}M is too large")
-    if external_ptr is not None: self.options = replace(self.options, external_ptr=external_ptr)
+    if external_ptr is not None:
+      self.options = replace(self.options, external_ptr=external_ptr, external_fd=external_fd, external_offset=external_offset)
     if self._base is not None:
       storage = replace(self.base.get_storage(), buf=self.allocator._offset(self.base._buf, self.nbytes, self.offset), maps={})
     elif opaque is not None:
