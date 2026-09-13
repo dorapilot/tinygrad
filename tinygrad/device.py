@@ -148,6 +148,7 @@ class Buffer:
 
   def get_storage(self, device:str|None=None) -> BufferStorage:
     storage = unwrap(self.ensure_allocated()._storage)
+    if storage.host is not None and not self.allocator._can_as_buffer(storage): storage = replace(storage, host=None)
     device = Device.canonicalize(device) if device is not None else self.device
     if device == self.device: return storage
     if (dev:=Device[device]) not in storage.maps:
@@ -294,6 +295,7 @@ class Allocator(Generic[DeviceType]):
   def _copyout(self, dest:memoryview, src): raise NotImplementedError("need copyout")
   def _map(self, buf) -> BufferStorage: raise NotImplementedError("need map")
   def _unmap(self, mb): pass  # default no-op; override if _map allocates iface-side state
+  def _can_as_buffer(self, storage:BufferStorage) -> bool: return True
   def _offset(self, buf, size:int, offset:int): raise NotImplementedError("need offset")
   # def _transfer(self, dest, src, sz:int, src_dev, dest_dev):
   def _encode_decode(self, bufout, bufin, desc, hist:list, shape:tuple[int,...], frame_pos:int): raise NotImplementedError("need encdec") # optional

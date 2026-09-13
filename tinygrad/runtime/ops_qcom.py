@@ -309,6 +309,9 @@ class QCOMAllocator(Allocator['QCOMDevice']):
   def _unmap(self, storage:BufferStorage): self.dev.iface.free(storage)
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
+  def _can_as_buffer(self, storage:BufferStorage) -> bool:
+    return not isinstance(storage.meta, MSMAllocation) or storage.meta.dma_buf_fd is None
+
   def _copyin(self, dest:int, src:memoryview):
     self.dev.synchronize()
     allocation = self.dev.iface._allocation(dest, src.nbytes)
@@ -483,12 +486,13 @@ class MSMIface:
       try:
         retained_fd = os.dup(fd)
         iova = msm_drm.DRM_IOCTL_MSM_GEM_INFO(self.fd, handle=handle, info=msm_drm.MSM_INFO_GET_IOVA).value
+        cpu_addr = FileIOInterface._mmap(0, length, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, retained_fd, 0)
       except Exception:
         try: msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=handle)
         finally:
           if retained_fd is not None: os.close(retained_fd)
         raise
-      allocation = self.allocations[handle] = MSMAllocation(handle, iova, length, 0, ptr - offset, retained_fd)
+      allocation = self.allocations[handle] = MSMAllocation(handle, iova, length, length, cpu_addr, retained_fd)
     else:
       if allocation.dma_buf_fd is None: allocation.dma_buf_fd = os.dup(fd)
       # PRIME aliases share one per-file GEM handle; close it only after the last user.
@@ -501,7 +505,9 @@ class MSMIface:
     if allocation.references > 1:
       allocation.references -= 1
       return
-    if allocation.mapped_size: self.fd.munmap(allocation.cpu_addr, allocation.mapped_size)
+    if allocation.mapped_size:
+      if self.fd.munmap(allocation.cpu_addr, allocation.mapped_size) != 0: raise RuntimeError("Failed to unmap MSM buffer")
+      allocation.mapped_size = 0
     msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     self.allocations.pop(allocation.handle)
     if allocation.dma_buf_fd is not None: os.close(allocation.dma_buf_fd)
