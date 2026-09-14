@@ -24,6 +24,19 @@ class TestMSMDRMUAPI(unittest.TestCase):
 
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestMSMInterface(unittest.TestCase):
+  def test_address_lookup_scaling(self):
+    from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface
+    class CountedAllocation(MSMAllocation):
+      reads = 0
+      def __getattribute__(self, name):
+        if name == 'iova': type(self).reads += 1
+        return super().__getattribute__(name)
+    iface = object.__new__(MSMIface)
+    iface.allocations = {i:CountedAllocation(i, (i+1)*4096, 2048, 0, 0) for i in range(1024)}
+    for i in range(0, 1024, 4):
+      self.assertEqual(iface._allocation((i+1)*4096 + 32, 64).handle, i)
+    self.assertLess(CountedAllocation.reads, 1024 * 20, 'Address resolution rescans all live allocations for each buffer')
+
   def test_free_retries_cleanup(self):
     from tinygrad.device import BufferStorage
     from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface
@@ -48,12 +61,14 @@ class TestMSMInterface(unittest.TestCase):
     iface.fd, iface.allocations = Mock(), {}
     iface.fd.munmap.side_effect = FileIOInterface.munmap
     memory = (ctypes.c_ubyte * mmap.PAGESIZE)()
+    with self.assertRaisesRegex(RuntimeError, 'not allocated'): iface._allocation(0x10000000, 64)
     with tempfile.TemporaryFile() as source, \
          patch.object(msm_drm, 'DRM_IOCTL_PRIME_FD_TO_HANDLE', return_value=Mock(handle=7)) as prime, \
          patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_INFO', return_value=Mock(value=0x10000000)), \
          patch.object(msm_drm, 'DRM_IOCTL_GEM_CLOSE') as close:
       source.truncate(mmap.PAGESIZE)
       first = iface.map(ctypes.addressof(memory), 64, source.fileno())
+      self.assertIs(iface._allocation(first.buf, 64), first.meta)
       second = iface.map(ctypes.addressof(memory) + 32, 32, source.fileno(), 32)
       self.assertEqual((first.buf, second.buf), (0x10000000, 0x10000020))
       self.assertIs(first.meta, second.meta)
@@ -63,11 +78,13 @@ class TestMSMInterface(unittest.TestCase):
       self.assertEqual(prime.call_count, 2)
       iface.free(first)
       close.assert_not_called()
+      self.assertIs(iface._allocation(second.buf, 32), second.meta)
       iface.free(second)
       close.assert_called_once_with(iface.fd, handle=7)
       self.assertEqual(iface.allocations, {})
       self.assertEqual(os.fstat(source.fileno()).st_size, mmap.PAGESIZE)
       iface.fd.munmap.assert_called_once()
+      with self.assertRaisesRegex(RuntimeError, 'not allocated'): iface._allocation(second.buf, 32)
 
   def test_allocation_and_submit(self):
     from tinygrad.runtime.ops_qcom import MSMAllocation, MSMIface
@@ -85,7 +102,9 @@ class TestMSMInterface(unittest.TestCase):
       patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_NEW', side_effect=[Mock(handle=7), Mock(handle=9)]) as gem_new,
       patch.object(msm_drm, 'DRM_IOCTL_MSM_GEM_INFO', side_effect=gem_info),
     ):
-      command, data = iface.alloc(17), iface.alloc(32)
+      command = iface.alloc(17)
+      self.assertIs(iface._allocation(command.buf + 4, 8), command.meta)
+      data = iface.alloc(32)
 
     self.assertIsInstance(command.meta, MSMAllocation)
     self.assertEqual((command.meta.size, command.meta.mapped_size), (17, mmap.PAGESIZE))
@@ -101,6 +120,10 @@ class TestMSMInterface(unittest.TestCase):
     ])
     self.assertEqual((cmds[0].submit_idx, cmds[0].submit_offset, cmds[0].size), (0, 4, 8))
     with self.assertRaisesRegex(RuntimeError, "not allocated"): iface.prepare_submit(command.buf + 16, 4, [])
+    with patch.object(msm_drm, 'DRM_IOCTL_GEM_CLOSE'):
+      iface.free(data)
+    with self.assertRaisesRegex(RuntimeError, 'not allocated'): iface.prepare_submit(command.buf, 4, [(data.buf, 4)])
+    self.assertIs(iface._allocation(command.buf, 4), command.meta)
 
 @unittest.skipIf(sys.platform == "win32", "QCOM is not supported on Windows")
 class TestMSMReplay(unittest.TestCase):

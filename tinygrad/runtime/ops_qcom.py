@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, sys, contextlib, glob, errno
+import os, ctypes, functools, mmap, struct, array, math, sys, contextlib, glob, errno, bisect
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from typing import Any
@@ -471,6 +471,7 @@ class MSMIface:
       raise
     allocation = MSMAllocation(gem.handle, iova, size, mapped_size, cpu_addr)
     self.allocations[gem.handle] = allocation
+    self.__dict__.pop('_allocation_index', None)
     return BufferStorage(iova, allocation, view)
 
   def map(self, ptr:int, size:int, fd:int|None=None, offset:int=0) -> BufferStorage:
@@ -493,6 +494,7 @@ class MSMIface:
           if retained_fd is not None: os.close(retained_fd)
         raise
       allocation = self.allocations[handle] = MSMAllocation(handle, iova, length, length, cpu_addr, retained_fd)
+      self.__dict__.pop('_allocation_index', None)
     else:
       if allocation.dma_buf_fd is None: allocation.dma_buf_fd = os.dup(fd)
       # PRIME aliases share one per-file GEM handle; close it only after the last user.
@@ -510,6 +512,7 @@ class MSMIface:
       allocation.mapped_size = 0
     msm_drm.DRM_IOCTL_GEM_CLOSE(self.fd, handle=allocation.handle)
     self.allocations.pop(allocation.handle)
+    self.__dict__.pop('_allocation_index', None)
     if allocation.dma_buf_fd is not None: os.close(allocation.dma_buf_fd)
 
   @contextlib.contextmanager
@@ -526,11 +529,14 @@ class MSMIface:
     try: yield
     finally: sync(flags | dma_buf.DMA_BUF_SYNC_END)
 
+  @functools.cached_property
+  def _allocation_index(self) -> list[MSMAllocation]: return sorted(self.allocations.values(), key=lambda a: a.iova)
+
   def _allocation(self, address:int, size:int) -> MSMAllocation:
-    matches = [allocation for allocation in self.allocations.values()
-               if allocation.iova <= address and address + size <= allocation.iova + allocation.size]
-    if len(matches) != 1: raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
-    return matches[0]
+    allocations = self._allocation_index
+    index = bisect.bisect_right(allocations, address, key=lambda a: a.iova) - 1
+    if index >= 0 and address + size <= (allocation:=allocations[index]).iova + allocation.size: return allocation
+    raise RuntimeError("MSM buffer was not allocated by the MSM DRM interface")
 
   def prepare_submit(self, command:int, size:int, buffers:list[tuple[int, int]]):
     if size <= 0 or size % 4: raise ValueError(f"MSM command size must be a positive multiple of 4, got {size}")
