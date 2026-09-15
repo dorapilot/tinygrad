@@ -580,7 +580,12 @@ class MSMIface:
     try:
       words = (ctypes.c_uint64 * (count * 2)).from_address(refs)
       prepared = self.prepare_submit(words[0] + offset, size, list(zip(words[::2], words[1::2])))
-      msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=prepared[0])
+      while True:
+        try:
+          msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=prepared[0])
+          break
+        except OSError as e:
+          if e.errno not in (errno.EINTR, errno.EAGAIN): raise
       return 0
     except Exception as e:
       self.submit_error = e

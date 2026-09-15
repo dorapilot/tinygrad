@@ -307,6 +307,25 @@ class TestMSMReplay(unittest.TestCase):
           self.assertIn(struct.pack('<Q', active._buf), command)
           self.assertNotIn(struct.pack('<Q', other._buf), command)
 
+  def test_submit_retries_transient_errors(self):
+    from tinygrad import dtypes
+    from tinygrad.device import Buffer
+    from tinygrad.uop.ops import UOp
+    from tinygrad.engine.realize import run_linear
+    linear = self.compile_signal()
+    buf = Buffer('QCOM', 257, dtypes.float32, preallocate=True)
+    errors = iter([errno.EINTR, errno.EAGAIN, None, errno.EINTR, None])
+    def submit(fd, **kwargs):
+      if (error := next(errors)) is not None: raise OSError(error, 'submit interrupted')
+      return self.record_submit(fd, **kwargs)
+    self.submit.side_effect = submit
+    for _ in range(2):
+      run_linear(linear, input_uops=[UOp.from_buffer(buf)], jit=True)
+      self.dev.synchronize()
+    self.assertEqual(len(self.submitted), 2)
+    self.assertEqual(self.submit.call_count, 5)
+    self.assertIsNone(self.dev.iface.submit_error)
+
   def test_submit_error_propagates(self):
     from tinygrad import dtypes
     from tinygrad.device import Buffer
