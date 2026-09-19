@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, sys, contextlib, glob, errno, bisect
+import os, ctypes, functools, mmap, struct, array, math, sys, contextlib, glob, errno, bisect, time
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from typing import Any
@@ -447,6 +447,7 @@ class MSMIface:
 
     self.allocations:dict[int, MSMAllocation] = {}
     self.fault_count = self._fault_count()
+    self.last_fence = 0
     self.submit_error:Exception|None = None
     self.submit_cb = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64)(self._submit)
     self.var_vals = {"msm_submit": ctypes.cast(self.submit_cb, ctypes.c_void_p).value}
@@ -583,6 +584,7 @@ class MSMIface:
       while True:
         try:
           msm_drm.DRM_IOCTL_MSM_GEM_SUBMIT(self.fd, __payload=prepared[0])
+          self.last_fence = prepared[0].fence
           break
         except OSError as e:
           if e.errno not in (errno.EINTR, errno.EAGAIN): raise
@@ -593,6 +595,16 @@ class MSMIface:
 
   def wait_signal(self, sig:MMIOInterface|memoryview, value:int, timeout:int|None=None):
     if self.submit_error is not None: raise self.submit_error
+    if sig[0] >= value: return
+    deadline = time.monotonic_ns() + int((timeout or self.dev.wait_timeout_ms) * 1_000_000)
+    wait_until = msm_drm.struct_drm_msm_timespec(tv_sec=deadline // 1_000_000_000, tv_nsec=deadline % 1_000_000_000)
+    while True:
+      try:
+        msm_drm.DRM_IOCTL_MSM_WAIT_FENCE(self.fd, fence=self.last_fence, queueid=0, timeout=wait_until)
+        return
+      except OSError as e:
+        if e.errno == errno.ETIMEDOUT: raise RuntimeError(f"{self.dev.device} signal wait timed out") from e
+        if e.errno not in (errno.EINTR, errno.EAGAIN): raise
 
   def on_device_hang(self):
     fault_count, previous_fault_count = self._fault_count(), self.fault_count

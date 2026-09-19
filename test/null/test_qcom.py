@@ -342,5 +342,38 @@ class TestMSMReplay(unittest.TestCase):
     with self.assertRaises(OSError): self.dev.synchronize()
     self.assertEqual(self.submit.call_count, 1)
 
+  def test_wait_for_pending_submit(self):
+    from tinygrad import dtypes
+    from tinygrad.device import Buffer
+    from tinygrad.uop.ops import UOp
+    from tinygrad.engine.realize import run_linear
+    linear = self.compile_signal()
+    buf = Buffer('QCOM', 257, dtypes.float32, preallocate=True)
+    self.submit.side_effect = lambda fd, **kwargs: setattr(kwargs['__payload'], 'fence', 7)
+    run_linear(linear, input_uops=[UOp.from_buffer(buf)], jit=True)
+    self.dev.timeline.host.view(fmt='Q')[1] = 1
+    attempts = []
+    def wait(fd, **kwargs):
+      self.assertEqual(kwargs['fence'], 7)
+      attempts.append((kwargs['timeout'].tv_sec, kwargs['timeout'].tv_nsec))
+      if len(attempts) == 1: raise OSError(errno.EINTR, 'interrupted')
+      self.dev.timeline.host.view(fmt='Q')[0] = self.dev.timeline.host.view(fmt='Q')[1]
+    with patch.object(msm_drm, 'DRM_IOCTL_MSM_WAIT_FENCE', side_effect=wait), \
+         patch('tinygrad.device.time.perf_counter', side_effect=[0, self.dev.wait_timeout_ms / 1000 + 1]):
+      self.dev.synchronize()
+    self.assertEqual(len(attempts), 2)
+    self.assertEqual(attempts[0], attempts[1], 'An interrupted wait must not extend its deadline')
+    with patch.object(msm_drm, 'DRM_IOCTL_MSM_WAIT_FENCE', side_effect=AssertionError('already completed')):
+      self.dev.synchronize()
+
+  def test_wait_errors_propagate(self):
+    for code, kind, text in ((errno.EIO, OSError, 'wait failed'), (errno.ETIMEDOUT, RuntimeError, 'QCOM hang detected')):
+      with self.subTest(code=code):
+        self.dev.iface.last_fence = 7
+        self.dev.timeline.host.view(fmt='Q')[1] = 1
+        with patch.object(msm_drm, 'DRM_IOCTL_MSM_WAIT_FENCE', side_effect=OSError(code, 'wait failed')), \
+             patch('tinygrad.device.time.perf_counter', side_effect=[0, self.dev.wait_timeout_ms / 1000 + 1]):
+          with self.assertRaisesRegex(kind, text): self.dev.synchronize()
+
 if __name__ == '__main__':
   unittest.main()
